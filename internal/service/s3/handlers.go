@@ -801,7 +801,7 @@ func (s *Service) CopyObject(w http.ResponseWriter, r *http.Request) {
 	dstKey := r.PathValue("key")
 
 	copySource := r.Header.Get("X-Amz-Copy-Source")
-	srcBucket, srcKey := parseCopySource(copySource)
+	srcBucket, srcKey, srcVersionID := parseCopySource(copySource)
 
 	if srcBucket == "" || srcKey == "" {
 		writeS3Error(w, r, "InvalidArgument", "Invalid copy source", http.StatusBadRequest)
@@ -809,7 +809,16 @@ func (s *Service) CopyObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	srcObj, err := s.storage.GetObject(r.Context(), srcBucket, srcKey)
+	var srcObj *Object
+
+	var err error
+
+	if srcVersionID != "" {
+		srcObj, err = s.storage.GetObjectVersion(r.Context(), srcBucket, srcKey, srcVersionID)
+	} else {
+		srcObj, err = s.storage.GetObject(r.Context(), srcBucket, srcKey)
+	}
+
 	if err != nil {
 		handleGetObjectError(w, r, err)
 
@@ -841,6 +850,10 @@ func (s *Service) CopyObject(w http.ResponseWriter, r *http.Request) {
 		LastModified: dstObj.LastModified.Format(timeFormatISO),
 	}
 
+	if srcVersionID != "" {
+		w.Header().Set("x-amz-copy-source-version-id", srcVersionID)
+	}
+
 	writeXMLResponse(w, result)
 
 	go s.emitObjectCreatedEvent(context.Background(), dstBucket, dstKey, dstObj.Size, dstObj.ETag)
@@ -849,7 +862,7 @@ func (s *Service) CopyObject(w http.ResponseWriter, r *http.Request) {
 
 // parseCopySource parses the X-Amz-Copy-Source header value.
 // Format: /bucket/key or bucket/key (URL-encoded).
-func parseCopySource(source string) (bucket, key string) {
+func parseCopySource(source string) (bucket, key, versionID string) {
 	// AWS accepts both plain ("bucket/key") and URL-encoded
 	// ("bucket%2Fkey") forms. Decode first so a single split handles
 	// both. PathUnescape (not QueryUnescape) preserves '+' which is a
@@ -860,12 +873,18 @@ func parseCopySource(source string) (bucket, key string) {
 
 	source = strings.TrimPrefix(source, "/")
 
-	idx := strings.IndexByte(source, '/')
+	sourcePath, rawQuery, _ := strings.Cut(source, "?")
+
+	idx := strings.IndexByte(sourcePath, '/')
 	if idx < 0 {
-		return "", ""
+		return "", "", ""
 	}
 
-	return source[:idx], source[idx+1:]
+	if values, err := url.ParseQuery(rawQuery); err == nil {
+		versionID = values.Get("versionId")
+	}
+
+	return sourcePath[:idx], sourcePath[idx+1:], versionID
 }
 
 // GetObject handles GET /{bucket}/{key...} - download an object.
@@ -2050,7 +2069,7 @@ func (s *Service) UploadPartCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	srcBucket, srcKey := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
+	srcBucket, srcKey, srcVersionID := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
 	if srcBucket == "" || srcKey == "" {
 		writeS3Error(w, r, "InvalidArgument", "Invalid copy source", http.StatusBadRequest)
 
@@ -2064,7 +2083,7 @@ func (s *Service) UploadPartCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	part, err := s.storage.UploadPartCopy(r.Context(), dstBucket, dstKey, uploadID, partNumber, srcBucket, srcKey, copyRange)
+	part, err := s.storage.UploadPartCopy(r.Context(), dstBucket, dstKey, uploadID, partNumber, srcBucket, srcKey, srcVersionID, copyRange)
 	if err != nil {
 		handleMultipartError(w, r, err)
 
@@ -2076,6 +2095,11 @@ func (s *Service) UploadPartCopy(w http.ResponseWriter, r *http.Request) {
 		LastModified: part.LastModified.UTC().Format(timeFormatISO),
 		ETag:         part.ETag,
 	}
+
+	if srcVersionID != "" {
+		w.Header().Set("x-amz-copy-source-version-id", srcVersionID)
+	}
+
 	writeXMLResponse(w, result)
 }
 
