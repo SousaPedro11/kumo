@@ -226,6 +226,8 @@ func (s *Service) GetItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	item = projectItemForExpression(item, req.ProjectionExpression, req.ExpressionAttributeNames)
+
 	writeJSONResponse(w, GetItemResponse{
 		Item: item,
 	})
@@ -388,6 +390,8 @@ func (s *Service) Query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	items = projectItemsForExpression(items, req.ProjectionExpression, req.ExpressionAttributeNames)
+
 	writeJSONResponse(w, QueryResponse{
 		Items:            items,
 		Count:            len(items),
@@ -434,6 +438,8 @@ func (s *Service) Scan(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	items = projectItemsForExpression(items, req.ProjectionExpression, req.ExpressionAttributeNames)
 
 	writeJSONResponse(w, ScanResponse{
 		Items:            items,
@@ -716,7 +722,16 @@ func (s *Service) TransactGetItems(w http.ResponseWriter, r *http.Request) {
 	}
 
 	responses := make([]TransactGetItemResponse, len(items))
+
 	for i, item := range items {
+		if req.TransactItems[i].Get != nil {
+			item = projectItemForExpression(
+				item,
+				req.TransactItems[i].Get.ProjectionExpression,
+				req.TransactItems[i].Get.ExpressionAttributeNames,
+			)
+		}
+
 		responses[i] = TransactGetItemResponse{Item: item}
 	}
 
@@ -833,6 +848,16 @@ func (s *Service) BatchGetItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoDBError(w, "InternalServerError", "Internal server error", http.StatusInternalServerError)
 
 		return
+	}
+
+	for tableName, keysAndAttributes := range req.RequestItems {
+		if items, ok := responses[tableName]; ok {
+			responses[tableName] = projectItemsForExpression(
+				items,
+				keysAndAttributes.ProjectionExpression,
+				keysAndAttributes.ExpressionAttributeNames,
+			)
+		}
 	}
 
 	writeJSONResponse(w, BatchGetItemResponse{Responses: responses})
