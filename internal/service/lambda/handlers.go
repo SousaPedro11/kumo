@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -341,9 +340,11 @@ func (s *Service) invokeViaRuntime(w http.ResponseWriter, r *http.Request, fn st
 }
 
 // invokeViaEndpoint forwards to a function's configured InvokeEndpoint.
+// Async invocations are queued on the dispatcher so the 202 means "accepted
+// for delivery": failed deliveries are retried instead of dropped.
 func (s *Service) invokeViaEndpoint(w http.ResponseWriter, r *http.Request, fn, endpoint string, payload []byte, async bool) {
 	if async {
-		s.invokeAsync(fn, endpoint, payload)
+		s.async.enqueue(fn, endpoint, payload)
 		writeInvokeAccepted(w)
 
 		return
@@ -408,37 +409,6 @@ func writeInvokeHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Amz-Executed-Version", "$LATEST")
 	w.Header().Set("X-Amz-Request-Id", uuid.New().String())
-}
-
-// invokeAsync invokes the function asynchronously.
-func (s *Service) invokeAsync(functionName, endpoint string, payload []byte) {
-	payloadCopy := make([]byte, len(payload))
-	copy(payloadCopy, payload)
-
-	go func() {
-		req, err := http.NewRequestWithContext(
-			context.Background(),
-			http.MethodPost,
-			endpoint,
-			bytes.NewReader(payloadCopy),
-		)
-		if err != nil {
-			slog.Error("async invoke failed to create request", "function", functionName, "error", err)
-
-			return
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			slog.Error("async invoke failed", "function", functionName, "error", err)
-
-			return
-		}
-
-		_ = resp.Body.Close()
-	}()
 }
 
 // invokeSync invokes the function synchronously and writes the response.
@@ -894,8 +864,6 @@ func (s *Service) GetPolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 // AddPermission adds a permission to a Lambda function's resource policy.
-//
-//nolint:funlen // Permission handling with validation and policy construction.
 func (s *Service) AddPermission(w http.ResponseWriter, r *http.Request) {
 	name := extractFunctionNameForListChild(r.URL.Path, "policy")
 	if name == "" {
@@ -911,22 +879,17 @@ func (s *Service) AddPermission(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.StatementID == "" {
-		writeFunctionError(w, ErrInvalidParameterValue, "StatementId is required", http.StatusBadRequest)
+	// Validate required fields (first empty wins).
+	for _, f := range []struct{ name, value string }{
+		{"StatementId", req.StatementID},
+		{"Action", req.Action},
+		{"Principal", req.Principal},
+	} {
+		if f.value == "" {
+			writeFunctionError(w, ErrInvalidParameterValue, f.name+" is required", http.StatusBadRequest)
 
-		return
-	}
-
-	if req.Action == "" {
-		writeFunctionError(w, ErrInvalidParameterValue, "Action is required", http.StatusBadRequest)
-
-		return
-	}
-
-	if req.Principal == "" {
-		writeFunctionError(w, ErrInvalidParameterValue, "Principal is required", http.StatusBadRequest)
-
-		return
+			return
+		}
 	}
 
 	fn, err := s.storage.GetFunction(r.Context(), name)
@@ -936,12 +899,35 @@ func (s *Service) AddPermission(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	stmt := buildPermissionStatement(&req, fn.FunctionArn)
+
+	if err := s.storage.AddPermission(r.Context(), name, stmt); err != nil {
+		handleFunctionError(w, err)
+
+		return
+	}
+
+	stmtJSON, err := json.Marshal(stmt)
+	if err != nil {
+		writeFunctionError(w, ErrServiceException, "Internal server error", http.StatusInternalServerError)
+
+		return
+	}
+
+	writeJSONResponse(w, http.StatusCreated, addPermissionResponse{
+		Statement: string(stmtJSON),
+	})
+}
+
+// buildPermissionStatement builds the resource-policy statement for AddPermission,
+// attaching SourceArn/SourceAccount conditions when present.
+func buildPermissionStatement(req *addPermissionRequest, resourceArn string) *PolicyStatement {
 	stmt := &PolicyStatement{
 		Sid:       req.StatementID,
 		Effect:    "Allow",
 		Principal: map[string]string{"Service": req.Principal},
 		Action:    req.Action,
-		Resource:  fn.FunctionArn,
+		Resource:  resourceArn,
 	}
 
 	if req.SourceArn != "" {
@@ -962,22 +948,7 @@ func (s *Service) AddPermission(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := s.storage.AddPermission(r.Context(), name, stmt); err != nil {
-		handleFunctionError(w, err)
-
-		return
-	}
-
-	stmtJSON, err := json.Marshal(stmt)
-	if err != nil {
-		writeFunctionError(w, ErrServiceException, "Internal server error", http.StatusInternalServerError)
-
-		return
-	}
-
-	writeJSONResponse(w, http.StatusCreated, addPermissionResponse{
-		Statement: string(stmtJSON),
-	})
+	return stmt
 }
 
 // RemovePermission removes a permission from a Lambda function's resource policy.
